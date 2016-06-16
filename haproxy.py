@@ -11,7 +11,9 @@
 import cStringIO as StringIO
 import socket
 import csv
+import glob
 import pprint
+import os
 
 import collectd
 
@@ -153,16 +155,16 @@ class HAProxySocket(object):
         return result
 
 
-def get_stats():
+def get_stats(socket):
     """
         Makes two calls to haproxy to fetch server info and server stats.
         Returns the dict containing metric name as the key and a tuple of metric value and the dict of dimensions if any
     """
-    if HAPROXY_SOCKET is None:
+    if socket is None:
         collectd.error("Socket configuration parameter is undefined. Couldn't get the stats")
         return
-    stats = []
-    haproxy = HAProxySocket(HAPROXY_SOCKET)
+    stats = [ ]
+    haproxy = HAProxySocket(socket)
 
     try:
         server_info = haproxy.get_server_info()
@@ -170,7 +172,7 @@ def get_stats():
     except socket.error:
         collectd.warning(
             'status err Unable to connect to HAProxy socket at %s' %
-            HAPROXY_SOCKET)
+            socket)
         return stats
 
     for key, val in server_info.iteritems():
@@ -198,12 +200,13 @@ def config(config_values):
 
     global PROXY_MONITORS, HAPROXY_SOCKET
     PROXY_MONITORS = [ ]
-    HAPROXY_SOCKET = DEFAULT_SOCKET
+    HAPROXY_SOCKET = [ ]
     for node in config_values.children:
         if node.key == "ProxyMonitor":
-              PROXY_MONITORS.append(node.values[0].lower())
+            PROXY_MONITORS.append(node.values[0].lower())
         elif  node.key == "Socket":
-            HAPROXY_SOCKET = node.values[0]
+            for socket in glob.glob(node.values[0]):
+              HAPROXY_SOCKET.append(socket)
         else:
             collectd.warning('Unknown config key: %s' % node.key)
     if not PROXY_MONITORS:
@@ -211,59 +214,44 @@ def config(config_values):
     PROXY_MONITORS = [ p.lower() for p in PROXY_MONITORS ]
 
 
-def _format_dimensions(dimensions):
-    """
-    Formats a dictionary of dimensions to a format that enables them to be
-    specified as key, value pairs in plugin_instance to signalfx. E.g.
-    >>> dimensions = {'a': 'foo', 'b': 'bar'}
-    >>> _format_dimensions(dimensions)
-    "[a=foo,b=bar]"
-    Args:
-    dimensions (dict): Mapping of {dimension_name: value, ...}
-    Returns:
-    str: Comma-separated list of dimensions
-    """
-
-    dim_pairs = ["%s=%s" % (k, v) for k, v in dimensions.iteritems()]
-    return "[%s]" % (",".join(dim_pairs))
-
-
 def collect_metrics():
     collectd.debug('beginning collect_metrics')
     """
         A callback method that gets metrics from HAProxy and records them to collectd.
     """
+    for socket in HAPROXY_SOCKET:
+        collectd.debug('starting to collect stats from socket at %s' % socket)
+        info = get_stats(socket)
+        process_name = os.path.basename(socket).split('.')[0]
 
-    info = get_stats()
+        if not info:
+            collectd.warning('%s: No data received' % PLUGIN_NAME)
+            return
 
-    if not info:
-        collectd.warning('%s: No data received' % PLUGIN_NAME)
-        return
+        for metric_name, metric_value, dimensions in info:
+            if not metric_name.lower() in METRIC_TYPES:
+                collectd.debug("Metric %s is not in the metric types" % metric_name)
+                continue
 
-    for metric_name, metric_value, dimensions in info:
-        if not metric_name.lower() in METRIC_TYPES:
-            collectd.debug("Metric %s is not in the metric types" % metric_name)
-            continue
+            translated_metric_name, val_type = METRIC_TYPES[metric_name.lower()]
 
-        translated_metric_name, val_type = METRIC_TYPES[metric_name.lower()]
-
-        collectd.debug('Collecting {0}: {1}'.format(translated_metric_name, metric_value))
-        datapoint = collectd.Values()
-        datapoint.type = val_type
-        datapoint.type_instance = translated_metric_name
-        datapoint.plugin = PLUGIN_NAME
-        if dimensions:
-            datapoint.plugin_instance = _format_dimensions(dimensions)
-        datapoint.values = (metric_value,)
-        pprint_dict = {
+            collectd.debug('Collecting {0}: {1}'.format(translated_metric_name, metric_value))
+            datapoint = collectd.Values()
+            datapoint.type = val_type
+            datapoint.type_instance = translated_metric_name
+            datapoint.plugin = '-'.join([ PLUGIN_NAME, process_name])
+            if dimensions:
+                datapoint.plugin_instance = '-'.join([dimensions['proxy_name'], dimensions['service_name']])
+            datapoint.values = (metric_value,)
+            pprint_dict = {
                     'plugin': datapoint.plugin,
                     'plugin_instance': datapoint.plugin_instance,
                     'type': datapoint.type,
                     'type_instance': datapoint.type_instance,
                     'values': datapoint.values
-                }
-        collectd.debug(pprint.pformat(pprint_dict))
-        datapoint.dispatch()
+                    }
+            collectd.debug(pprint.pformat(pprint_dict))
+            datapoint.dispatch()
 
 collectd.register_config(config)
 collectd.register_read(collect_metrics)
